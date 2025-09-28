@@ -1,79 +1,74 @@
-// Replace with your deployed Render backend URL:
-const ws = new WebSocket("wss://YOUR-RENDER-BACKEND.onrender.com");
+// server/server.js
+const express = require("express");
+const http = require("http");
+const WebSocket = require("ws");
+const cors = require("cors");
 
-let currentGroup = null;
-let username = "";
-let display = "";
+const app = express();
+app.use(cors());
 
-const $ = id => document.getElementById(id);
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
-ws.addEventListener("open", () => {
-  console.log("✅ Connected to Render backend");
-});
+let users = {}; // { wsId: {username, display} }
+let groups = {}; // { groupId: {name, members:Set, messages:[]} }
 
-ws.addEventListener("message", e => {
-  const data = JSON.parse(e.data);
-
-  if (data.type === "groupCreated") {
-    addGroup(data.groupId, data.name);
-  }
-
-  if (data.type === "joined") {
-    currentGroup = data.groupId;
-    $("currentGroupTitle").textContent = "Group: " + currentGroup;
-  }
-
-  if (data.type === "message") {
-    renderMessage(data);
-  }
-});
-
-function addGroup(id, name) {
-  const div = document.createElement("div");
-  div.className = "group-item";
-  div.textContent = name;
-  div.onclick = () => {
-    ws.send(JSON.stringify({ type: "joinGroup", groupId: id }));
-    currentGroup = id;
-  };
-  $("groupList").appendChild(div);
+function broadcast(groupId, data) {
+  if (!groups[groupId]) return;
+  groups[groupId].members.forEach((userId) => {
+    const client = users[userId]?.ws;
+    if (client && client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(data));
+    }
+  });
 }
 
-function renderMessage(m) {
-  const list = $("msgList");
-  const d = document.createElement("div");
-  d.className = "msg" + (m.user === username ? " me" : "");
-  d.innerHTML = `<div class="meta">${m.display} • ${new Date(m.ts).toLocaleTimeString()}</div><div>${m.text}</div>`;
-  list.appendChild(d);
-  list.scrollTop = list.scrollHeight;
-}
+wss.on("connection", (ws) => {
+  const id = Date.now().toString(36) + Math.random().toString(36).substr(2);
+  users[id] = { ws, username: "anon-" + id, display: "Anon" };
 
-// UI handlers
-$("loginBtn").onclick = () => {
-  username = $("username").value.trim() || "guest";
-  display = $("display").value.trim() || username;
+  ws.on("message", (msg) => {
+    try {
+      const data = JSON.parse(msg);
+      if (data.type === "auth") {
+        users[id].username = data.username;
+        users[id].display = data.display || data.username;
+      }
+      if (data.type === "createGroup") {
+        const gid = "g_" + Date.now().toString(36);
+        groups[gid] = {
+          name: data.name,
+          members: new Set([id]),
+          messages: [],
+        };
+        ws.send(JSON.stringify({ type: "groupCreated", groupId: gid, name: data.name }));
+      }
+      if (data.type === "joinGroup") {
+        const g = groups[data.groupId];
+        if (g) g.members.add(id);
+        ws.send(JSON.stringify({ type: "joined", groupId: data.groupId }));
+      }
+      if (data.type === "message") {
+        const g = groups[data.groupId];
+        if (!g) return;
+        const msgObj = {
+          user: users[id].username,
+          display: users[id].display,
+          text: data.text,
+          ts: Date.now(),
+        };
+        g.messages.push(msgObj);
+        broadcast(data.groupId, { type: "message", groupId: data.groupId, ...msgObj });
+      }
+    } catch (e) {
+      console.error("Bad message:", e);
+    }
+  });
 
-  ws.send(JSON.stringify({ type: "auth", username, display }));
+  ws.on("close", () => {
+    delete users[id];
+  });
+});
 
-  $("authView").style.display = "none";
-  $("mainApp").style.display = "flex";
-  $("meUser").textContent = username;
-  $("profileUser").textContent = username;
-  $("profileDisplay").textContent = display;
-};
-
-$("createGroupBtn").onclick = () => {
-  const name = $("newGroupName").value.trim();
-  if (!name) return;
-  ws.send(JSON.stringify({ type: "createGroup", name }));
-  $("newGroupName").value = "";
-};
-
-$("sendBtn").onclick = () => {
-  const text = $("msgInput").value.trim();
-  if (!text || !currentGroup) return;
-  ws.send(JSON.stringify({ type: "message", groupId: currentGroup, text }));
-  $("msgInput").value = "";
-};
-
-$("logoutBtn").onclick = () => location.reload();
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, () => console.log("WebSocket server running on port " + PORT));
